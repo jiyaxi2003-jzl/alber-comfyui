@@ -1,0 +1,36 @@
+Alber H3 Director Console
+========================
+
+This package is derived from:
+
+  ComfyUI_MiniMaxH3_Director
+  Copyright AIMixer
+  https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director
+  Licensed under the Apache License, Version 2.0.
+
+The upstream source was provided by the user as
+`ComfyUI_MiniMaxH3_Director-main.zip`.
+
+Derivative work contained here (dated 2026-11-01):
+
+  - Keeps the upstream timeline UI and execution path unchanged.
+  - Adds nodes/director_console.py: a single-node console that makes the
+    model / clip / video_vae / audio_vae inputs optional and loads a built-in
+    MiniMax H3 base UNET, LoRA, text encoder and VAEs from node widgets when
+    those inputs are not wired. External inputs still take priority.
+  - Registers new node type ids H3DirectorConsole / H3Console* so the package
+    can coexist with, and not overwrite, an installed upstream copy.
+  - Renames the plugin folder to Alber-ComfyUI-MiniMaxH3-Director.
+  - Prefixes NODE_DISPLAY_NAME_MAPPINGS entries with "Alber 导演台".
+  - Renames frontend extension ids to Alber.* / alber.*.
+  - Changes the HTTP route namespace /h3console/director/* to /alber/director/*
+    (director/http_routes.py, director/prompt_enhance_routes.py, web/js/*.js).
+  - Changes the logging tag to Alber-H3-Director-Console.
+  - Adds web/js/alber_pika_mode.js: a two-button bar at the top of the console
+    node that sets the node's own lora_name widget to either
+    pika_h3_flex_ref2va_v1_bf16.safetensors or
+    pika_h3_flex_fl2va_v1_bf16.safetensors, and syncs task_type accordingly.
+  - Pins both Pika H3 Flex LoRAs to the top of the lora_name dropdown
+    (nodes/director_console.py, PIKA_LORAS / _lora_choices).
+
+The original Apache License 2.0 text is included in `LICENSE`.

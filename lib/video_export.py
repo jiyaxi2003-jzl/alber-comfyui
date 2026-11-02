@@ -1,0 +1,234 @@
+"""Encode IMAGE tensors (+ optional AUDIO) to MP4 via ffmpeg."""
+
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import subprocess
+import tempfile
+import wave
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+
+log = logging.getLogger("ComfyUI-MiniMaxH3-Director.video_export")
+
+
+def _ffmpeg_bin() -> str | None:
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+
+        return get_ffmpeg_exe()
+    except ImportError:
+        return shutil.which("ffmpeg")
+
+
+def _even(n: int) -> int:
+    n = max(2, int(n))
+    return n if n % 2 == 0 else n + 1
+
+
+def _frames_to_rgb_u8(frames: torch.Tensor) -> np.ndarray:
+    """NHWC 帧 → uint8 RGB。
+
+    三种输入都要认（历史上都出现过）：
+      * float32/float16，0–1 值域（ComfyUI 标准 IMAGE）
+      * uint8，0–255（分段缓存 ``.pt`` 就是这么存的）
+      * float，0–255 值域（缓存被 ``.float()`` 直接读出来的情况）
+
+    **NaN 必须挡住**：VAE 解码或采样发散时帧里会出现 NaN，
+    ``(arr*255).astype(uint8)`` 会把 NaN 静默变成 0 —— 成片就是一条纯黑的 mp4，
+    而文件大小、帧数、音轨全都正常，非常难查。这里显式清洗并告警。
+    """
+    if not isinstance(frames, torch.Tensor) or frames.ndim != 4:
+        raise ValueError(f"Expected NHWC frames tensor, got {type(frames)} shape={getattr(frames, 'shape', None)}")
+
+    src = frames.detach().cpu()
+    if src.dtype == torch.uint8:
+        arr = src.numpy().astype(np.float32) / 255.0
+    else:
+        arr = src.float().numpy()
+        finite = np.isfinite(arr)
+        peak = float(arr[finite].max()) if finite.any() else 0.0
+        if peak > 1.5:
+            # 0–255 值域的浮点，按 255 归一
+            arr = arr / 255.0
+
+    if arr.shape[-1] < 3:
+        raise ValueError(f"Expected at least 3 channels, got shape {arr.shape}")
+    arr = arr[..., :3]
+
+    bad = int(np.count_nonzero(~np.isfinite(arr)))
+    if bad:
+        total = int(arr.size)
+        pct = bad / total * 100.0 if total else 0.0
+        log.warning(
+            "帧数据里有 %d/%d 个非有限值（NaN/Inf，%.2f%%，shape=%s）——"
+            "已按 0 处理；若是整帧 NaN，说明采样或 VAE 解码发散了。",
+            bad, total, pct, tuple(arr.shape),
+        )
+        arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)
+
+    return (np.clip(arr, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+
+
+def _pad_even_hw(rgb: np.ndarray) -> np.ndarray:
+    """Pad H/W to even sizes required by yuv420p / libx264."""
+    n, h, w, c = rgb.shape
+    eh, ew = _even(h), _even(w)
+    if eh == h and ew == w:
+        return rgb
+    out = np.zeros((n, eh, ew, c), dtype=np.uint8)
+    out[:, :h, :w, :] = rgb
+    return out
+
+
+def _write_wav(path: Path, audio: dict[str, Any]) -> bool:
+    wave_t = audio.get("waveform")
+    if not isinstance(wave_t, torch.Tensor) or wave_t.numel() <= 0:
+        return False
+    sr = int(audio.get("sample_rate") or 0)
+    if sr <= 0:
+        return False
+    # [B, C, T] → [T, C] int16
+    w = wave_t.detach().cpu().float()
+    if w.ndim == 2:
+        w = w.unsqueeze(0)
+    if w.ndim != 3:
+        return False
+    w = w[0].transpose(0, 1).contiguous()  # T, C
+    channels = int(w.shape[1])
+    if channels <= 0:
+        return False
+    pcm = (w.clamp(-1.0, 1.0) * 32767.0).to(torch.int16).numpy()
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm.tobytes())
+    return True
+
+
+def write_frames_to_mp4(
+    path: str | Path,
+    frames: torch.Tensor,
+    *,
+    fps: float,
+    audio: dict[str, Any] | None = None,
+    crf: int = 18,
+    preset: str = "veryfast",
+) -> Path:
+    """Write NHWC float frames to ``path`` as H.264 MP4. Raises on failure."""
+    ffmpeg = _ffmpeg_bin()
+    if not ffmpeg:
+        raise RuntimeError(
+            "ffmpeg unavailable (install FFmpeg on PATH or `pip install imageio-ffmpeg`)"
+        )
+
+    dest = Path(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fps = float(fps or 24.0)
+    if fps <= 0:
+        fps = 24.0
+
+    rgb = _pad_even_hw(_frames_to_rgb_u8(frames))
+    n, h, w, _ = rgb.shape
+    if n <= 0:
+        raise ValueError("No frames to encode")
+    log.info(
+        "MP4 编码：%d 帧 %dx%d @ %.2f fps，源 dtype=%s shape=%s，亮度均值=%.1f",
+        n, w, h, fps,
+        getattr(frames, "dtype", "?"), tuple(getattr(frames, "shape", ())),
+        float(rgb[:: max(1, n // 8)].mean()) if n else 0.0,
+    )
+
+    tmp_dir = tempfile.mkdtemp(prefix="minimax_mp4_")
+    tmp_mp4 = Path(tmp_dir) / "out.mp4"
+    wav_path = Path(tmp_dir) / "audio.wav"
+    try:
+        has_audio = bool(audio) and _write_wav(wav_path, audio)
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{w}x{h}",
+            "-r",
+            f"{fps:.6f}",
+            "-i",
+            "-",
+        ]
+        if has_audio:
+            cmd += ["-i", str(wav_path)]
+        cmd += [
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            str(preset or "veryfast"),
+            "-crf",
+            str(int(max(0, min(51, int(crf))))),
+            "-movflags",
+            "+faststart",
+        ]
+        if has_audio:
+            cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
+        else:
+            cmd += ["-an"]
+        cmd.append(str(tmp_mp4))
+
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        # Do not write+close stdin then communicate(): on Linux that raises
+        # ``ValueError: flush of closed file`` after ffmpeg closes the pipe.
+        # communicate(input=) writes and closes once, and drains stderr.
+        raw = np.ascontiguousarray(rgb)
+        try:
+            _stdout, stderr = proc.communicate(input=raw.tobytes())
+        except (BrokenPipeError, ValueError) as exc:
+            # ffmpeg already closed stdin (common after a long rawvideo feed).
+            try:
+                if proc.poll() is None:
+                    proc.wait(timeout=180)
+            except Exception:
+                proc.kill()
+                proc.wait()
+            stderr = b""
+            if not tmp_mp4.is_file() or tmp_mp4.stat().st_size <= 0:
+                raise RuntimeError(f"ffmpeg encode failed: {exc}") from exc
+        if proc.returncode not in (0, None) or not tmp_mp4.is_file() or tmp_mp4.stat().st_size <= 0:
+            err = (stderr or b"").decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"ffmpeg encode failed (code={proc.returncode}): {err or 'unknown'}")
+
+        # Atomic-ish publish: write to sibling temp then replace.
+        publish_tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
+        try:
+            if publish_tmp.exists():
+                publish_tmp.unlink()
+            shutil.copy2(tmp_mp4, publish_tmp)
+            os.replace(publish_tmp, dest)
+        finally:
+            if publish_tmp.exists():
+                try:
+                    publish_tmp.unlink()
+                except OSError:
+                    pass
+        return dest
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
